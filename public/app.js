@@ -25,6 +25,11 @@ const els = {
   jarWrap: $('#jar-table-wrap'),
   jarEmpty: $('#jar-empty'),
 
+  snapshotExportBtn: $('#snapshot-export-btn'),
+  snapshotImportBtn: $('#snapshot-import-btn'),
+  snapshotFile: $('#snapshot-file'),
+  snapshotResult: $('#snapshot-result'),
+
   clockNow: $('#clock-now'),
   clockMeta: $('#clock-meta'),
   clockSeconds: $('#clock-seconds'),
@@ -566,10 +571,117 @@ els.resetBtn.addEventListener('click', async () => {
     els.scriptReadResult.classList.add('hidden');
     els.scriptWriteResult.classList.add('hidden');
     els.clockResult.classList.add('hidden');
+    els.snapshotResult.classList.add('hidden');
     els.storeCookie.value = '';
     toast('Cookie 罐已重置（容量设置保留，时钟回到启动时刻）');
   } catch (err) {
     toast(err instanceof Error ? err.message : String(err));
+  }
+});
+
+/* ---------- 场景快照：JSON 导出 / 导入 ---------- */
+
+function snapshotStamp(ts) {
+  // 文件名用本地时间戳，形如 20260927-153012（取快照内 clock.now）
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function renderSnapshotImport(data) {
+  els.snapshotResult.classList.remove('hidden');
+  if (!data.ok) {
+    els.snapshotResult.innerHTML =
+      `<div class="banner bad pre"><span class="banner-title">⛔ 快照导入失败</span>${escapeHtml(data.error || '快照无效')}</div>`;
+    return;
+  }
+  const expiredLine = data.expiredKept > 0
+    ? `，其中 <strong>${data.expiredKept}</strong> 条已过期（仍原样保留，下次匹配或容量淘汰时按既有规则处理）`
+    : '';
+  els.snapshotResult.innerHTML =
+    `<div class="banner ok pre"><span class="banner-title">✅ 快照导入成功</span>${escapeHtml(data.message || '')}</div>` +
+    `<div class="meta-line">恢复 <strong>${data.importedCookies}</strong> 条 Cookie${expiredLine}；` +
+    `下一创建序号 #${data.nextIndex}；演算时间 ${escapeHtml(data.clock ? data.clock.readable : '')}（已推进 ${data.clock ? data.clock.elapsedSeconds : 0} 秒）。` +
+    `发送排序、默认 Lax 120 秒宽限与容量淘汰均与导出前的连续操作一致。</div>`;
+}
+
+els.snapshotExportBtn.addEventListener('click', async () => {
+  els.snapshotExportBtn.disabled = true;
+  try {
+    const resp = await fetch('/api/snapshot');
+    if (!resp.ok) {
+      let msg = `导出失败（HTTP ${resp.status}）`;
+      try { const d = await resp.json(); if (d && d.error) msg = d.error; } catch (e) { /* 忽略 */ }
+      throw new Error(msg);
+    }
+    const snapshot = await resp.json();
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cookie-jar-snapshot-v${snapshot.version}-${snapshotStamp((snapshot.clock && snapshot.clock.now) || Date.now())}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('场景快照已下载（JSON，带版本/容量规则/时钟）');
+  } catch (err) {
+    toast(err instanceof Error ? err.message : String(err));
+  } finally {
+    els.snapshotExportBtn.disabled = false;
+  }
+});
+
+els.snapshotImportBtn.addEventListener('click', () => {
+  els.snapshotFile.value = '';
+  els.snapshotFile.click();
+});
+
+els.snapshotFile.addEventListener('change', async () => {
+  const file = els.snapshotFile.files && els.snapshotFile.files[0];
+  if (!file) return;
+  let snapshot;
+  try {
+    snapshot = JSON.parse(await file.text());
+  } catch {
+    renderSnapshotImport({ ok: false, error: `文件 ${file.name} 不是合法 JSON，无法解析（罐、容量与时钟均未改动）` });
+    return;
+  }
+  els.snapshotImportBtn.disabled = true;
+  els.snapshotExportBtn.disabled = true;
+  try {
+    // 请求体即快照 JSON 本身；服务端先完整校验，再一次性替换（失败时状态不变）
+    const resp = await fetch('/api/snapshot/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(snapshot),
+    });
+    let data;
+    try {
+      data = await resp.json();
+    } catch {
+      throw new Error(`服务端返回异常（HTTP ${resp.status}）`);
+    }
+    if (!resp.ok) throw Object.assign(new Error((data && data.error) || `导入失败（HTTP ${resp.status}）`), { data });
+    renderSnapshotImport(data);
+    // 恢复后刷新罐表、容量面板与时钟面板
+    if (data.cookies) renderJar(data.cookies);
+    if (data.capacity) {
+      renderCapacityUsage(data.capacity);
+      syncCapacityInputs(data.capacity);
+    }
+    if (data.clock) renderClock(data.clock);
+    toast('快照已导入：罐、容量规则与时钟已一次性恢复');
+  } catch (err) {
+    const data = err && err.data;
+    if (data) {
+      renderSnapshotImport(data);
+    } else {
+      renderSnapshotImport({ ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  } finally {
+    els.snapshotImportBtn.disabled = false;
+    els.snapshotExportBtn.disabled = false;
   }
 });
 

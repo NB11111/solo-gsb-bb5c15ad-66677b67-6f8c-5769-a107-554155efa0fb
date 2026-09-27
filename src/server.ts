@@ -23,6 +23,12 @@
  *   POST /api/clock/advance      { seconds } 以正整数秒推进演算时钟；非法输入（缺省、0、负数、
  *                                非整数、非数字）返回 400，时钟与罐均不变；推进本身不删除条目，
  *                                过期项留待下次匹配或容量淘汰按既有规则处理
+ *   GET  /api/snapshot           下载场景快照（带 version；原始 Cookie 条目含分区键 / 创建序号 /
+ *                                最近访问时间、容量规则、时钟起点与当前值、下一序号；原样保留过期项）
+ *   POST /api/snapshot/import    导入场景快照（请求体即快照 JSON 本身）：先完整校验结构、时间范围、
+ *                                条目身份唯一性与序号一致性、容量规则，再一次性替换状态；
+ *                                任一校验失败返回 400，旧罐、容量与时钟均不变；
+ *                                导入不触发容量淘汰，过期项原样保留
  *   POST /api/reset              清空内存罐（容量设置保留；演算时钟同步回到服务启动时刻）
  *
  * 演算时钟：服务启动时固定当前真实时间为起点，之后只经 /api/clock/advance 推进；
@@ -33,12 +39,13 @@
  */
 import express from 'express';
 import path from 'path';
-import { CookieJar } from './cookieJar';
+import { CookieJar, SnapshotValidationError } from './cookieJar';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: '64kb' }));
+// 快照导入的 JSON 体积可能较大（上限内数千条目），统一放宽到 2mb
+app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // 全局唯一的内存 Cookie 罐（演示用，单实例即可）
@@ -276,6 +283,55 @@ app.post('/api/reset', (_req, res) => {
     capacity: jar.capacity(),
     clock: jar.clock(),
   });
+});
+
+// ---------------- 场景快照（JSON 下载 / 导入） ----------------
+
+app.get('/api/snapshot', (_req, res) => {
+  // 直接返回快照文件本体（无外层包装），与 POST /api/snapshot/import 的请求体一一对应，
+  // 保存为 .json 后可原样导回。
+  res.setHeader('Content-Disposition', 'attachment; filename="cookie-jar-snapshot.json"');
+  res.json(jar.exportSnapshot());
+});
+
+app.post('/api/snapshot/import', (req, res) => {
+  // 请求体即快照 JSON 本身（GET /api/snapshot 下载的内容）。
+  // 先完整校验，再一次性替换；任何失败都在状态变更之前返回 400。
+  try {
+    const result = jar.importSnapshot(req.body);
+    res.json({
+      ok: true,
+      message:
+        `快照导入成功：恢复 ${result.importedCookies} 条 Cookie` +
+        (result.expiredKept > 0 ? `（其中 ${result.expiredKept} 条已过期，仍原样保留）` : '') +
+        '；容量规则、演算时钟起点/当前值与下一序号已一并恢复',
+      cookies: jar.list(),
+      capacity: result.capacity,
+      clock: result.clock,
+      nextIndex: result.nextIndex,
+      importedCookies: result.importedCookies,
+      expiredKept: result.expiredKept,
+    });
+  } catch (err) {
+    if (err instanceof SnapshotValidationError) {
+      res.status(400).json({ ok: false, error: err.message });
+      return;
+    }
+    res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// JSON 解析失败（含导入的快照体积超限 / 非法 JSON）：返回与其它 400 一致的 JSON 错误
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && 'body' in (err as unknown as Record<string, unknown>)) {
+    res.status(400).json({ ok: false, error: '请求体不是合法 JSON，无法解析（罐、容量与时钟均未改动）' });
+    return;
+  }
+  if (err instanceof Error && (err as { type?: string }).type === 'entity.too.large') {
+    res.status(400).json({ ok: false, error: '快照体积超过 2mb 上限（罐、容量与时钟均未改动）' });
+    return;
+  }
+  next(err);
 });
 
 // 兜底：未匹配的 /api 路径返回 JSON 404，其它路径交回前端首页

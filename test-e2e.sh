@@ -1008,6 +1008,268 @@ check "重置提示时钟复位" "演算时钟" "$R"
 post /api/reset '{}' >/dev/null
 
 echo
+echo "------- 场景快照（GET /api/snapshot + POST /api/snapshot/import） -------"
+
+SNAP=/tmp/cjl-snapshot.json
+BADSNAP=/tmp/cjl-bad-snapshot.json
+
+echo "== N0. 准备场景：容量规则 + 多种条目（含分区项、HttpOnly、默认/显式 SameSite） =="
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":10,"domainLimits":{"snap.test":4}}' >/dev/null
+# #1 默认 Lax 持久项（用于发送排序与 120 秒宽限连续性）
+post /api/store '{"url":"https://snap.test/app","setCookie":"def=1; Path=/app; Max-Age=3600"}' >/dev/null
+# #2 显式 Strict 项
+post /api/store '{"url":"https://snap.test/","setCookie":"str=1; Path=/; Secure; SameSite=Strict"}' >/dev/null
+# #3 会话项（HttpOnly）
+post /api/store '{"url":"https://snap.test/","setCookie":"sess=s; Path=/; HttpOnly"}' >/dev/null
+# #4 分区项（site-a 分区）
+post /api/store '{"url":"https://widget.vendor.com/f","setCookie":"ch=p; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://site-a.example/"}' >/dev/null
+# #5 短命项（将在推进后过期，导出时仍保留）
+post /api/store '{"url":"https://snap.test/","setCookie":"dying=old; Path=/; Max-Age=50"}' >/dev/null
+adv 10
+# 发送一次命中 /app 与 / 的请求，刷新 #1/#2/#3 的最近访问时间（#4/#5 不命中）
+post /api/send '{"url":"https://snap.test/app/x"}' >/dev/null
+adv 40   # 当前推进 50 秒：dying 正好过期（50 > 50 边界），仍留在罐中
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+names=sorted(c['name'] for c in d['cookies'])
+assert names==['ch','def','dying','sess','str'], names
+assert d['capacity']['globalLimit']==10, d['capacity']
+dl={x['domain']:x['limit'] for x in d['capacity']['domainLimits']}
+assert dl.get('snap.test')==4, dl
+print('✅ 场景准备完成：5 条（含已过期 dying、分区 ch、HttpOnly sess），容量 10 / snap.test=4，时钟 50 秒')" && PASS=$((PASS+1)) || { echo "❌ 场景准备失败"; FAIL=$((FAIL+1)); }
+
+echo "== N1. 导出快照：带版本、原始条目字段、容量规则、时钟起点/当前值、下一序号 =="
+curl -s "$BASE/api/snapshot" -o "$SNAP"
+python3 - "$SNAP" <<'EOF'
+import sys,json
+s=json.load(open(sys.argv[1]))
+assert s['format']=='cookie-jar-lab-snapshot', s.get('format')
+assert s['version']==1, s.get('version')
+assert s['nextIndex']==6, s['nextIndex']
+assert s['capacity']['globalLimit']==10, s['capacity']
+dl={x['domain']:x['limit'] for x in s['capacity']['domainLimits']}
+assert dl=={'snap.test':4}, dl
+assert (s['clock']['now']-s['clock']['startedAt'])//1000==50, s['clock']
+assert s['exportedAt']==s['clock']['now']
+by={c['name']:c for c in s['cookies']}
+assert len(by)==5
+d=by['def']
+assert d['creationIndex']==1 and d['sameSite']=='lax' and d['sameSiteDefault'] is True
+assert d['partitionKey'] is None and d['partitioned'] is False
+# 最近访问在 t=10s 被发送刷新（lastAccessed > createdAt=0）
+assert d['lastAccessedAt']==s['clock']['startedAt']+10_000, d['lastAccessedAt']
+p=by['ch']
+assert p['partitioned'] is True and p['partitionKey']=='https://site-a.example'
+assert by['sess']['httpOnly'] is True and 'expiresAt' not in by['sess']
+assert by['dying']['expiresAt']==s['clock']['startedAt']+50_000
+# 身份唯一、序号唯一且 nextIndex 大于最大序号
+ids=[(c['name'],c['domain'],c['path'],c['partitionKey']) for c in s['cookies']]
+assert len(set(ids))==5
+idxs=[c['creationIndex'] for c in s['cookies']]
+assert len(set(idxs))==5 and s['nextIndex']>max(idxs)
+print('✅ 快照字段完整：version=1、原始分区键/序号/时间戳/LRA、容量与时钟均在')
+EOF
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== N2. 清空现状后导入：一次性恢复罐、容量、时钟起点/当前值、下一序号 =="
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+adv 999
+R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @"$SNAP")
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['ok'] is True, d
+assert d['importedCookies']==5, d
+assert d['expiredKept']==1, d          # dying 已过期仍保留
+assert d['nextIndex']==6, d
+assert d['capacity']['globalLimit']==10
+assert {x['domain']:x['limit'] for x in d['capacity']['domainLimits']}=={'snap.test':4}
+assert d['clock']['elapsedSeconds']==50, d['clock']
+names=sorted(c['name'] for c in d['cookies'])
+assert names==['ch','def','dying','sess','str'], names
+print('✅ 导入恢复 5 条（含 1 条已过期保留），容量、时钟 50 秒、nextIndex=6 全部还原')" && PASS=$((PASS+1)) || { echo "❌ 导入恢复失败"; FAIL=$((FAIL+1)); }
+
+echo "== N3. 恢复后发送排序与导出前连续操作一致（Path 长度降序 → 创建序号升序） =="
+R=$(post /api/send '{"url":"https://snap.test/app/x"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+# /app 命中 def(#1)；/ 命中 str(#2)、sess(#3)；Path 长的 def 必须在前
+check "def（Path=/app）排在最前" "def=1; " "$HDR"
+check "Strict 与 HttpOnly 同站照常发送" "str=1" "$HDR"
+check "HttpOnly 网络接口照常发送" "sess=s" "$HDR"
+echo "$HDR" | python3 -c "
+import sys
+h=sys.stdin.read().strip()
+order=[p.split('=')[0] for p in h.split('; ')]
+assert order[0]=='def', order
+assert order.index('str') < order.index('sess'), order   # 同 Path 长度按创建序号
+print('✅ 排序:', '; '.join(order))" && PASS=$((PASS+1)) || { echo "❌ 恢复后排序不一致"; FAIL=$((FAIL+1)); }
+
+echo "== N4. 恢复后默认 Lax 120 秒宽限连续（创建 50 秒放行；推进到 121 秒拒绝） =="
+R=$(post /api/send '{"url":"https://snap.test/app/x","topUrl":"https://other.org/","method":"POST","topLevelNav":true}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "创建 50 秒 ≤ 120 秒，默认 Lax 跨站顶层 POST 放行" "def=1" "$HDR"
+adv 71
+R=$(post /api/send '{"url":"https://snap.test/app/x","topUrl":"https://other.org/","method":"POST","topLevelNav":true}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"def=1"* ]]; then echo "✅ 恢复后推进到 121 秒，120 秒宽限连续生效（def 不再放行）"; PASS=$((PASS+1));
+else echo "❌ 宽限未连续（def 仍被放行）"; FAIL=$((FAIL+1)); fi
+check "宽限已过原因" "120 秒宽限已过" "$R"
+
+echo "== N5. 过期项恢复后仍保留：发送排除、罐中不消失，容量淘汰时才先清理 =="
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+dy=[c for c in d['cookies'] if c['name']=='dying'][0]
+assert dy['expired'] is True, dy
+print('✅ 已过期的 dying 仍在罐中并标记 expired')" && PASS=$((PASS+1)) || { echo "❌ 过期项未保留"; FAIL=$((FAIL+1)); }
+R=$(post /api/send '{"url":"https://snap.test/"}')
+check "过期项发送被排除" "已过期" "$R"
+# 重新导入原始快照（时钟 50 秒、snap.test 上限 4、4 条 snap.test 条目含刚过期的 dying），
+# 直接再入罐第 5 条 -> 超限时先物理清理恢复出来的过期 dying，无需按优先级淘汰
+R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @"$SNAP")
+check "重新导入快照以验证容量淘汰连续性" '"ok":true' "$R"
+R=$(post /api/store '{"url":"https://snap.test/","setCookie":"late=1; Path=/"}')
+check "超限时先清理恢复的过期项 dying" '"cookie":"dying=old"' "$R"
+check "清理的是过期原因" '"reason":"expired"' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+ds=[s for s in d['eviction']['stages'] if s['scope']=='domain'][0]
+assert ds['expiredRemoved']==1 and ds['evictedCount']==0, ds
+print('✅ 仅过期清理 1 条，未发生优先级淘汰')" && PASS=$((PASS+1)) || { echo "❌ 过期清理数量不符"; FAIL=$((FAIL+1)); }
+
+echo "== N6. 下一序号连续：恢复后新条目沿用 nextIndex=#6 =="
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+late=[c for c in d['jar'] if c['name']=='late'][0]
+assert late['index']==6, late
+assert max(c['index'] for c in d['jar'])==6
+print('✅ 新入罐 late 的创建序号 #6（接续快照 nextIndex）')" && PASS=$((PASS+1)) || { echo "❌ 下一序号未连续"; FAIL=$((FAIL+1)); }
+
+echo "== N7. 容量淘汰（LRA）与导出前连续操作一致（LRA 随快照恢复并参与排序） =="
+# 独立构造一个可判定的 LRA 场景（同优先级，仅 LRA 不同），导出后在全新罐导入再触发淘汰
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+post /api/store '{"url":"https://lra.test/keep","setCookie":"c1=1; Path=/keep; Priority=Medium"}' >/dev/null
+adv 10
+post /api/store '{"url":"https://lra.test/other","setCookie":"c2=2; Path=/other; Priority=Medium"}' >/dev/null
+adv 10
+# 仅请求 /keep：只发送 c1，c1 的 LRA 被刷新到 30s，c2 停在 20s
+post /api/send '{"url":"https://lra.test/keep/x"}' >/dev/null
+curl -s "$BASE/api/snapshot" -o /tmp/cjl-lra.json
+# 在全新罐导入（容量先清空），再设置域容量=2 并入罐第三条 -> LRA 最老的 c2 应先出局
+post /api/reset '{}' >/dev/null
+R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @/tmp/cjl-lra.json)
+check "LRA 场景导入成功" '"ok":true' "$R"
+post /api/capacity '{"domainLimits":{"lra.test":2}}' >/dev/null
+R=$(post /api/store '{"url":"https://lra.test/z","setCookie":"c3=3; Path=/z; Priority=Medium"}')
+check "按恢复的 LRA 淘汰最久未访问的 c2" '"cookie":"c2=2"' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+alive=sorted(c['name'] for c in d['jar'])
+assert alive==['c1','c3'], alive
+print('✅ c1（导出前发送刷新过 LRA）存活、c2（LRA 最老）出局：容量淘汰与导出前连续操作一致')" && PASS=$((PASS+1)) || { echo "❌ LRA 连续性错误"; FAIL=$((FAIL+1)); }
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo "== N8. 分区项恢复后仍按分区键隔离发送 =="
+# N7 导入过其它场景，先恢复含分区项 ch 的原始快照
+R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @"$SNAP")
+check "恢复含分区项的快照" '"ok":true' "$R"
+R=$(post /api/send '{"url":"https://widget.vendor.com/f","topUrl":"https://site-a.example/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "site-a 分区项恢复后可发送" "ch=p" "$HDR"
+R=$(post /api/send '{"url":"https://widget.vendor.com/f","topUrl":"https://site-b.example/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"ch=p"* ]]; then echo "✅ site-b 分区下恢复的 ch 仍被分区隔离"; PASS=$((PASS+1));
+else echo "❌ 分区隔离失效"; FAIL=$((FAIL+1)); fi
+
+echo "== N9. 非法快照：400 且旧罐、容量、时钟均不变 =="
+
+snap_mutate() { # mutation -> 写入 $BADSNAP
+python3 - "$SNAP" "$BADSNAP" "$1" <<'EOF'
+import sys,json
+src,dst,mut=sys.argv[1],sys.argv[2],sys.argv[3]
+s=json.load(open(src))
+if mut=='version': s['version']=2
+elif mut=='format': s['format']='nope'
+elif mut=='identity':
+    s['cookies'][1]['name']=s['cookies'][0]['name']
+    s['cookies'][1]['domain']=s['cookies'][0]['domain']
+    s['cookies'][1]['path']=s['cookies'][0]['path']
+    s['cookies'][1]['partitionKey']=None
+elif mut=='dupindex': s['cookies'][1]['creationIndex']=s['cookies'][0]['creationIndex']
+elif mut=='nextindex': s['nextIndex']=2
+elif mut=='time-now': s['clock']['now']=s['clock']['startedAt']-1000
+elif mut=='time-cookie': s['cookies'][0]['createdAt']=s['clock']['now']+999_000
+elif mut=='elapsed': s['clock']['now']=s['clock']['startedAt']+500
+elif mut=='field': s['cookies'][0]['sameSite']='banana'
+elif mut=='part':
+    pc=[c for c in s['cookies'] if c['partitioned']][0]
+    pc['partitionKey']=None
+elif mut=='limit': s['capacity']['globalLimit']=0
+elif mut=='notobj': json.dump([1,2,3], open(dst,'w')); sys.exit(0)
+json.dump(s, open(dst,'w'))
+EOF
+}
+
+# 先恢复一个已知良好状态作为对照
+curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @"$SNAP" >/dev/null
+BEFORE=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;d=json.load(sys.stdin);print(len(d['cookies']),d['clock']['elapsedSeconds'],d['capacity']['globalLimit'])")
+
+check_bad_import() { # mutation  expected_substr
+  snap_mutate "$1"
+  CODE=$(curl -s -o /tmp/cjl-resp.json -w '%{http_code}' -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @"$BADSNAP")
+  R=$(cat /tmp/cjl-resp.json)
+  if [ "$CODE" = "400" ]; then echo "✅ [$1] 拒绝（400）"; PASS=$((PASS+1)); else echo "❌ [$1] 应 400，实际 $CODE"; FAIL=$((FAIL+1)); fi
+  check "[$1] $2" "$2" "$R"
+  AFTER=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;d=json.load(sys.stdin);print(len(d['cookies']),d['clock']['elapsedSeconds'],d['capacity']['globalLimit'])")
+  if [ "$AFTER" = "$BEFORE" ]; then echo "✅ [$1] 旧罐、容量、时钟均未改动（$AFTER）"; PASS=$((PASS+1));
+  else echo "❌ [$1] 失败导入改动了状态：before=($BEFORE) after=($AFTER)"; FAIL=$((FAIL+1)); fi
+}
+
+check_bad_import version "快照版本不受支持"
+check_bad_import format "format 标识必须为"
+check_bad_import identity "条目身份不唯一"
+check_bad_import dupindex "creationIndex"
+check_bad_import nextindex "nextIndex"
+check_bad_import time-now "不能早于"
+check_bad_import time-cookie "超出时间范围"
+check_bad_import elapsed "整秒"
+check_bad_import field "sameSite 必须是"
+check_bad_import part "必须带非空 partitionKey"
+check_bad_import limit "globalLimit"
+check_bad_import notobj "不是对象"
+
+# 非法 JSON 文本
+CODE=$(curl -s -o /tmp/cjl-resp.json -w '%{http_code}' -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' -d '{oops')
+[ "$CODE" = "400" ] && { echo "✅ 非法 JSON 文本 -> 400"; PASS=$((PASS+1)); } || { echo "❌ 非法 JSON 应 400，实际 $CODE"; FAIL=$((FAIL+1)); }
+check "非法 JSON 提示" "不是合法 JSON" "$(cat /tmp/cjl-resp.json)"
+AFTER=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;d=json.load(sys.stdin);print(len(d['cookies']),d['clock']['elapsedSeconds'])")
+[ "$AFTER" = "5 50" ] && { echo "✅ 非法 JSON 后状态不变（5 条 / 50 秒）"; PASS=$((PASS+1)); } || { echo "❌ 非法 JSON 后状态被改动：$AFTER"; FAIL=$((FAIL+1)); }
+
+echo "== N10. 空罐快照可正常导出 / 导入（nextIndex 从 1 开始） =="
+post /api/reset '{}' >/dev/null
+curl -s "$BASE/api/snapshot" | python3 -c "
+import sys,json
+s=json.load(sys.stdin)
+assert s['cookies']==[] and s['nextIndex']==1 and s['version']==1, s
+print('✅ 空罐快照：cookies=[]、nextIndex=1')" && PASS=$((PASS+1)) || { echo "❌ 空罐快照异常"; FAIL=$((FAIL+1)); }
+curl -s "$BASE/api/snapshot" -o /tmp/cjl-empty.json
+R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @/tmp/cjl-empty.json)
+check "空快照导入成功" '"ok":true' "$R"
+
+# 还原：清空容量，恢复空罐
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -43,6 +43,17 @@ Partitioned 分区项仍按既有 Secure 与分区键规则正常入罐；**跨�
 过期清理**都可以逐秒步进复现；**推进本身不删除条目**（过期项留在罐中标灰展示，
 下次匹配或容量淘汰时再按既有规则处理），**重置罐时时钟同步回到启动时刻**。
 
+另有 **💾 场景快照（带版本的 JSON 导出 / 导入）**：在「🫙 当前 Cookie 罐」面板点击
+**⬇ 导出快照**（或 `GET /api/snapshot`）下载 JSON 文件，完整保存**原始 Cookie 条目**
+（值、域、Path、Secure/HttpOnly/SameSite/Priority、**分区键**、**创建序号**、
+createdAt 与**最近访问时间**，**已过期项也原样保留**）、**容量规则**（全局与每可注册域上限）、
+**演算时钟起点与当前值**及**下一创建序号**。点击 **⬆ 导入快照**（或
+`POST /api/snapshot/import`，请求体即快照 JSON 本身）会**先完整校验**（结构与版本、
+时间范围、条目身份 `(name, domain, path, 分区键)` 唯一性、创建序号唯一且与下一序号一致、
+容量规则合法），**全部通过后才一次性替换**罐、容量与时钟；任一错误都返回 400 且
+**旧罐、容量规则与时钟均不变**。导入**不触发容量淘汰、不清理过期项**——恢复后的
+**发送排序、默认 Lax 120 秒宽限与容量淘汰（含最近访问时间）与导出前的连续操作完全一致**。
+
 技术栈：**TypeScript + Express + 原生 HTML/CSS/JS**（前端无框架、无构建），数据仅存内存；
 same-site 判定使用 [tldts](https://github.com/remusao/tldts)（内置公共后缀列表 PSL，含私有域段）。
 
@@ -63,9 +74,9 @@ docker compose up --build -d
 
 > **http://localhost:3000**
 
-- Web 界面与全部 API（`/api/store`、`/api/send`、`/api/clock` 等）都在 **同一端口 localhost:3000** 提供；
+- Web 界面与全部 API（`/api/store`、`/api/send`、`/api/clock`、`/api/snapshot` 等）都在 **同一端口 localhost:3000** 提供；
   - Web 界面：**http://localhost:3000/**
-  - API 根路径：**http://localhost:3000/api/...**（如 `GET http://localhost:3000/api/jar`）
+  - API 根路径：**http://localhost:3000/api/...**（如 `GET http://localhost:3000/api/jar`、`GET http://localhost:3000/api/snapshot`）
 - 容器内服务端口：**3000**（由 `docker-compose.yml` 的 `PORT=3000` 环境变量指定）；
 - 宿主机默认映射端口：**3000**（想换端口改 `docker-compose.yml` 左侧，如 `"3001:3000"`）。
 
@@ -131,6 +142,18 @@ docker compose up --build -d    # 改完代码后重新构建并启动
    非法输入（0、负数、非整数、非数字）被拒绝且**时钟与罐均不变**；
    **推进本身不删除条目**，过期项留待下次匹配或容量淘汰处理；
    点击 **重置** 清空罐时，时钟同步回到启动时刻。
+7. **💾 场景快照**（「🫙 当前 Cookie 罐」面板右上角）：
+   - 点击 **⬇ 导出快照**（`GET /api/snapshot`）下载带版本的 JSON 文件
+     （文件名含快照版本与导出时刻，如 `cookie-jar-snapshot-v1-20260927-153012.json`）；
+     内容是罐的**完整状态**：原始 Cookie 条目（含分区键、创建序号、createdAt / 最近访问时间，
+     **已过期项同样保留**）、容量规则、时钟起点 / 当前值、下一创建序号。
+   - 点击 **⬆ 导入快照**（`POST /api/snapshot/import`）选择此前下载的 JSON：
+     服务端**先完整校验**结构与版本、时间范围、条目身份唯一性、序号一致性与容量规则，
+     **全部通过后一次性替换**状态；失败时**旧罐、容量与时钟均不变**，结果区逐条列出问题。
+   - 导入结果（恢复条数、保留的过期条数、下一序号、演算时间）直接显示在罐表下方，
+     罐表格、容量用量与时钟面板随即刷新。导入**不触发容量淘汰、不清理过期项**：
+     之后的发送排序、默认 Lax 120 秒宽限与容量淘汰（含 LRA）与导出前的连续操作一致；
+     新入罐条目的创建序号接续快照中的「下一序号」。
 
 ### 容量淘汰的顺序
 
@@ -365,6 +388,42 @@ updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量�
 - **重置同步复位**：`POST /api/reset` 清空罐的同时把时钟拨回启动时刻（容量设置仍保留），
   便于从零复现整条时间线。
 
+### 场景快照（带版本 JSON；`GET /api/snapshot`、`POST /api/snapshot/import`）
+
+- **导出内容（快照即文件本体，无外层包装，可原样导回）**：
+  - `format: "cookie-jar-lab-snapshot"`、`version: 1`（当前唯一受支持版本）；
+  - `cookies`：**原始 Cookie 条目**（不是展示视图），逐条包含
+    name/value/domain/path/hostOnly/secure/httpOnly、`sameSite` 与 `sameSiteDefault`、
+    `priority` 与 `priorityDefault`、`partitioned` 与 **`partitionKey`（分区键）**、
+    `expiresAt`（会话 cookie 缺省该字段）、**`creationIndex`（创建序号）**、
+    `createdAt` / `updatedAt` / **`lastAccessedAt`（最近访问时间）**；
+    **已过期项与普通项一样原样导出**；
+  - `capacity`：`globalLimit`（`null`=不限）与 `domainLimits`（每个可注册域的上限数组）；
+  - `clock`：**`startedAt`（时钟起点）与 `now`（时钟当前值）**，均为整数毫秒时间戳；
+  - `nextIndex`：**下一创建序号**（严格大于现存最大 `creationIndex`）。
+- **导入先完整校验、再一次性替换**：
+  - **结构与版本**：顶层必须是 JSON 对象；`format` 标识与 `version=1` 必须匹配；
+    容量字段、时钟字段、条目字段的类型逐一校验（枚举值如 `sameSite` 只接受
+    `strict/lax/none`，`partitioned=true` 必须带非空 `partitionKey` 等）；
+  - **时间范围**：`clock.now ≥ clock.startedAt` 且相差**整秒**（时钟只按整秒推进）；
+    每条的 `createdAt / updatedAt / lastAccessedAt` 必须是
+    `[clock.startedAt, clock.now]` 内的整数毫秒时间戳，`expiresAt` 为合法整数或缺省；
+  - **条目身份唯一性**：`(name, domain, path, partitionKey)` 在快照中不得重复
+    （存储身份，分区键 `null` 表示普通项）；`creationIndex` 也不得重复；
+  - **序号一致性**：`nextIndex` 必须大于所有现存条目的 `creationIndex`；
+  - **容量规则**：全局 / 域级上限必须是 ≥1 的正整数或 `null`，域名非空、不重复。
+- **失败的原子性**：任何一处不合法都返回 **400** 并在 `error` 中汇总全部问题
+  （最多前 20 条），**旧罐、容量规则与演算时钟均保持不变**；非法 JSON 文本、
+  非对象请求体、超过 2mb 的请求体同样 400 且不改动状态。
+- **恢复语义**：校验通过后一次性替换罐、容量、时钟起点 / 当前值与下一序号；
+  **不触发容量淘汰、不清理过期项**（过期项继续保留，待下次匹配 / 淘汰按既有规则处理）。
+  恢复后：
+  - **发送排序**沿用 Path 长度降序、创建序号升序（创建序号与导出前完全相同）；
+  - **默认 Lax 120 秒宽限**按条目的原始 `createdAt` 与恢复后的时钟连续计算；
+  - **容量淘汰**（先清过期、再 Priority → **最近访问时间（已随快照恢复）** → 创建序号）
+    与导出前的连续操作一致；新入罐条目从快照的 `nextIndex` 开始编号；
+  - 随后 **重置** 罐时时钟回到的是**快照内的 `startedAt`**（即恢复后的时钟起点）。
+
 ---
 
 ## 🔌 HTTP API
@@ -372,6 +431,8 @@ updatedAt / lastAccessedAt）与容量状态保持不变**，也不触发容量�
 | 方法 | 路径 | Body（JSON） | 说明 |
 |------|------|--------------|------|
 | GET | `/api/jar` | — | 当前罐快照（`cookies` + `capacity`：容量设置与各可注册域用量 + `clock`：演算时钟） |
+| GET | `/api/snapshot` | — | **下载场景快照**：直接返回带版本的快照 JSON 文件本体（`format` + `version=1` + 原始 `cookies`（含分区键/创建序号/最近访问时间/已过期项）+ `capacity` + `clock{startedAt,now}` + `nextIndex`），保存为 `.json` 后可原样导回（响应带 `Content-Disposition: attachment`） |
+| POST | `/api/snapshot/import` | 快照 JSON 本体（即 `GET /api/snapshot` 下载的内容） | **导入场景快照**：先完整校验结构与版本、时间范围、条目身份 `(name,domain,path,分区键)` 唯一性、创建序号与 `nextIndex` 一致性、容量规则，全部通过后一次性替换罐 / 容量 / 时钟起点与当前值 / 下一序号；任何错误返回 **400** 且**旧罐、容量与时钟均不变**；不触发容量淘汰、不清理过期项。成功返回 `importedCookies` / `expiredKept` / `nextIndex` 及最新 `cookies` / `capacity` / `clock` |
 | GET | `/api/clock` | — | 读取演算时钟：`now`/`readable`（当前演算时间）、`startedAt`/`startedAtReadable`（启动时刻）、`elapsedSeconds`（已推进秒数） |
 | POST | `/api/clock/advance` | `{ "seconds": 120 }` | 以**正整数秒**推进演算时钟（数字或数字字符串均可）；非法输入（缺省、0、负数、非整数、非数字）返回 400 且**时钟与罐均不变**。推进本身不删除条目，响应附最新 `clock`、`cookies` 与 `capacity`（过期/剩余展示随新时间刷新） |
 | POST | `/api/store` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | 顺序写入一条 Set-Cookie；`topUrl` 为顶层页面 URL，仅 `Partitioned` cookie 必需（计算分区键），普通 cookie 可省略。`blockThirdParty=true` 开启屏蔽第三方 Cookie：此时 `topUrl` 必填且须有效，跨站响应拒绝写入/删除普通 Cookie（不改动罐、不触发容量淘汰），Partitioned 分区项不受影响。响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
@@ -445,6 +506,17 @@ curl -s -X POST http://localhost:3000/api/clock/advance \
 curl -s -X POST http://localhost:3000/api/clock/advance \
   -H 'Content-Type: application/json' -d '{"seconds":0}'
 
+# 下载场景快照（带 version；原始条目 + 分区键/序号/LRA + 容量规则 + 时钟起点/当前值 + 下一序号）
+curl -s http://localhost:3000/api/snapshot -o cookie-jar-snapshot.json
+
+# 导入场景快照（请求体即下载的 JSON 本体；先完整校验再一次性替换，失败则状态不变）
+curl -s -X POST http://localhost:3000/api/snapshot/import \
+  -H 'Content-Type: application/json' --data @cookie-jar-snapshot.json
+
+# 非法快照（如版本不支持 / 身份重复 / 时间范围非法）-> 400，error 汇总全部问题，旧状态不变
+curl -s -X POST http://localhost:3000/api/snapshot/import \
+  -H 'Content-Type: application/json' -d '{"format":"cookie-jar-lab-snapshot","version":99}'
+
 # document.cookie 读取：HttpOnly 项不在 cookieString 中（不应用 SameSite、不刷新访问时间）
 curl -s -X POST http://localhost:3000/api/script/read \
   -H 'Content-Type: application/json' \
@@ -486,10 +558,10 @@ curl -s -X POST http://localhost:3000/api/script/write \
 ├── package.json
 ├── tsconfig.json
 ├── src
-│   ├── server.ts           # Express 入口与 API（含容量设置、document.cookie 脚本读写、演算时钟读取/推进接口）
-│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰/document.cookie 脚本视角/演算时钟）
+│   ├── server.ts           # Express 入口与 API（含容量设置、document.cookie 脚本读写、演算时钟读取/推进、场景快照导出/导入接口）
+│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰/document.cookie 脚本视角/演算时钟/带版本场景快照的导出与校验导入）
 └── public
-    ├── index.html          # 原生前端页面（含顶层 URL 输入、容量压力配置、document.cookie 演算与演算时钟面板）
+    ├── index.html          # 原生前端页面（含顶层 URL 输入、容量压力配置、document.cookie 演算、演算时钟面板与罐面板的快照导出/导入按钮）
     ├── styles.css
     └── app.js
 ```
@@ -527,3 +599,11 @@ npm run dev
 > `POST /api/clock/advance` 按正整数秒推进（不随真实时间流动）；网络写入/发送、
 > `document.cookie` 读写、罐快照与容量淘汰都取该时钟，推进本身不删除条目，
 > 重置罐时时钟回到启动时刻；同一时间戳内的次序由创建序号兜底。
+> **场景快照**（`GET /api/snapshot` 下载 / `POST /api/snapshot/import` 导入，
+> 界面为罐面板「⬇ 导出快照 / ⬆ 导入快照」）是**带版本（version=1）的 JSON**：
+> 原样保存原始 Cookie 条目（含分区键、创建序号、最近访问时间，过期项也保留）、
+> 容量规则、时钟起点 / 当前值与下一序号；导入先完整校验（结构、时间范围、
+> 条目身份唯一性、序号一致性、容量规则）再一次性替换，**失败时旧罐、容量与时钟均不变**，
+> 且不触发容量淘汰；恢复后的发送排序、默认 Lax 宽限与容量淘汰与导出前连续操作一致。
+> 除可选的 `PORT` 环境变量（容器内默认 3000）外**无需任何额外配置**，
+> `docker compose up --build -d` 一条命令即可使用，Web 与 API 同在 **3000** 端口。
