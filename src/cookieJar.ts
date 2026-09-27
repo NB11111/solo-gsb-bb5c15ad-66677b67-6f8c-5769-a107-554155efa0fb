@@ -72,6 +72,17 @@
  *   - 推进本身不删除任何条目：过期项仍留在罐中（标灰展示），下次匹配或容量淘汰时
  *     再按既有规则处理；
  *   - 重置罐（POST /api/reset）时时钟同步回到启动时刻。
+ *
+ *  场景快照（GET /api/snapshot 下载、POST /api/snapshot/import 导入）：
+ *   - 快照带格式标识与版本号，完整保存：原始 Cookie 条目（含分区键、创建序号、
+ *     创建/更新/最近访问时间等全部字段）、容量规则（全局与每可注册域上限）、
+ *     演算时钟起点与当前值、下一创建序号；
+ *   - 导入先做完整校验（结构、时间范围、条目身份唯一性、序号一致性、枚举与布尔字段），
+ *     任一不满足即拒绝；全部通过后才一次性替换罐内容、容量规则与时钟——
+ *     失败时旧罐、容量和时钟均不变；
+ *   - 恢复是精确状态替换：不执行容量淘汰，过期项原样保留；恢复后后续发送排序
+ *     （Path 长度 / 创建序号）、默认 Lax 的 120 秒跨站顶层 POST 宽限（按创建时间）
+ *     与容量淘汰（Priority / 最近访问 / 创建序号）均与导出前的连续操作完全一致。
  */
 import { getDomain } from 'tldts';
 
@@ -262,6 +273,63 @@ export interface ClockView {
   startedAtReadable: string;
   /** 相对启动时刻已推进的整秒数 */
   elapsedSeconds: number;
+}
+
+/** 场景快照格式标识（防止误传其它 JSON） */
+export const SNAPSHOT_FORMAT = 'cookie-jar-lab-snapshot';
+/** 场景快照版本号（结构升级时递增；导入仅接受当前版本） */
+export const SNAPSHOT_VERSION = 1;
+
+/** 快照中的单条 cookie：即 StoredCookie 的完整原始字段（非展示视图） */
+export interface SnapshotCookie extends StoredCookie {}
+
+/**
+ * 场景快照：可完整复原演算场景的全部状态。
+ * 保存原始 Cookie 条目（含分区键、创建序号、创建/更新/最近访问时间）、
+ * 容量规则（全局与每可注册域上限）、演算时钟起点与当前值、下一创建序号。
+ */
+export interface JarSnapshot {
+  /** 固定格式标识 */
+  format: typeof SNAPSHOT_FORMAT;
+  /** 快照版本号 */
+  version: typeof SNAPSHOT_VERSION;
+  /** 导出时间戳（真实墙钟 ms；仅元信息，不参与演算） */
+  exportedAt: number;
+  /** 导出时的可读时间（本地时区；仅元信息） */
+  exportedAtReadable: string;
+  /** 完整原始 Cookie 条目（按创建序号升序） */
+  cookies: SnapshotCookie[];
+  /** 下一创建序号（恢复后新条目从此编号继续） */
+  nextIndex: number;
+  /** 容量规则：全局上限（null = 不限）与每个可注册域上限 */
+  capacity: {
+    globalLimit: number | null;
+    domainLimits: Array<{ domain: string; limit: number }>;
+  };
+  /** 演算时钟：起点（ms）与当前值（ms）；二者之差为非负整秒 */
+  clock: {
+    startedAt: number;
+    now: number;
+  };
+}
+
+/** 导入快照的结果（成功后回传完整新状态供界面刷新） */
+export interface SnapshotImportResult {
+  ok: boolean;
+  /** 恢复的条目数（含过期项，过期项原样保留） */
+  restoredCount: number;
+  /** 恢复的域级容量规则条数 */
+  domainLimitCount: number;
+  /** 全局容量上限；null = 不限 */
+  globalLimit: number | null;
+  /** 恢复后的演算时钟视图 */
+  clock: ClockView;
+  /** 恢复后的容量视图 */
+  capacity: CapacityView;
+  /** 恢复后的罐展示视图（过期项标灰但保留） */
+  jar: CookieView[];
+  /** 实际生效的快照 */
+  snapshot: JarSnapshot;
 }
 
 export interface StoreResult {
@@ -703,8 +771,8 @@ export class CookieJar {
   private globalLimit: number | null = null;
   /** 每个可注册域的容量上限；未列出表示不限 */
   private domainLimits = new Map<string, number>();
-  /** 演算时钟起点：服务启动时固定的真实时间（重置罐时时钟回到该时刻） */
-  private readonly clockStart: number = Date.now();
+  /** 演算时钟起点：服务启动时固定的真实时间（重置罐时时钟回到该时刻；导入快照时随快照恢复） */
+  private clockStart: number = Date.now();
   /** 演算时钟当前值（ms）：不随真实时间流动，只能经 advance() 以正整数秒推进 */
   private clockNow: number = this.clockStart;
 
@@ -1467,6 +1535,69 @@ export class CookieJar {
     // 容量设置属于模拟参数，重置罐内容时保留，便于重复演算
   }
 
+  /**
+   * 导出场景快照：完整保存原始 Cookie 条目（含分区键、创建序号、创建/更新/最近访问
+   * 时间）、容量规则、演算时钟起点与当前值、下一创建序号，并带格式标识与版本号。
+   */
+  snapshot(): JarSnapshot {
+    const exportedAt = Date.now();
+    return {
+      format: SNAPSHOT_FORMAT,
+      version: SNAPSHOT_VERSION,
+      exportedAt,
+      exportedAtReadable: formatTime(exportedAt),
+      cookies: this.cookies
+        .slice()
+        .sort((a, b) => a.creationIndex - b.creationIndex)
+        .map((c) => ({ ...c })),
+      nextIndex: this.nextIndex,
+      capacity: {
+        globalLimit: this.globalLimit,
+        domainLimits: [...this.domainLimits.entries()]
+          .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+          .map(([domain, limit]) => ({ domain, limit })),
+      },
+      clock: {
+        startedAt: this.clockStart,
+        now: this.clockNow,
+      },
+    };
+  }
+
+  /**
+   * 导入场景快照：先对入参做完整校验（结构、时间范围、条目身份唯一性、序号一致性、
+   * 枚举与布尔字段），任一不满足即抛错——此时旧罐、容量规则与时钟均不变；
+   * 全部通过后才一次性替换全部状态。恢复是精确状态替换：不执行容量淘汰，
+   * 过期项原样保留；恢复后的发送排序、默认 Lax 宽限与容量淘汰与导出前连续操作一致。
+   */
+  importSnapshot(input: unknown): SnapshotImportResult {
+    const snapshot = validateSnapshot(input);
+
+    // 校验全部通过后一次性替换（先构造新值再整体赋上，任何中途异常都不会留下半改状态）
+    const cookies = snapshot.cookies.map((c) => ({ ...c }));
+    const domainLimits = new Map<string, number>();
+    for (const { domain, limit } of snapshot.capacity.domainLimits) {
+      domainLimits.set(domain, limit);
+    }
+    this.cookies = cookies;
+    this.nextIndex = snapshot.nextIndex;
+    this.globalLimit = snapshot.capacity.globalLimit;
+    this.domainLimits = domainLimits;
+    this.clockStart = snapshot.clock.startedAt;
+    this.clockNow = snapshot.clock.now;
+
+    return {
+      ok: true,
+      restoredCount: cookies.length,
+      domainLimitCount: domainLimits.size,
+      globalLimit: this.globalLimit,
+      clock: this.clock(),
+      capacity: this.capacityView(),
+      jar: this.views(this.clockNow),
+      snapshot,
+    };
+  }
+
   // ---------------- 内部辅助 ----------------
 
   private findCookie(name: string, domain: string, path: string, partitionKey: string | null): StoredCookie | undefined {
@@ -1853,4 +1984,277 @@ export class CookieJar {
       usage,
     };
   }
+}
+
+// ---------------- 场景快照校验 ----------------
+
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+const isInt = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && Number.isSafeInteger(v);
+
+const isBool = (v: unknown): v is boolean => typeof v === 'boolean';
+
+const SAME_SITE_VALUES = new Set<SameSiteMode>(['strict', 'lax', 'none']);
+const PRIORITY_VALUES = new Set<CookiePriority>(['low', 'medium', 'high']);
+
+/**
+ * 完整校验一份场景快照，通过后返回规范化（深拷贝、域名规范化）的快照；
+ * 任一问题都抛出带定位信息的错误。校验覆盖：
+ *  - 结构：顶层格式标识 / 版本 / 各字段类型；
+ *  - 时间范围：时钟 now ≥ startedAt（整秒差），条目的创建/更新/最近访问时间
+ *    均落在 [startedAt, now]，过期时间为非负整数，推进语义不允许时间倒流；
+ *  - 条目身份唯一性：(name, domain, path, partitionKey) 不得重复，创建序号也不得重复；
+ *  - 序号一致性：创建序号为 ≥1 的整数且全部小于 nextIndex；
+ *  - 枚举 / 布尔字段、SameSite=None 必须 Secure、Partitioned 必须带非空分区键
+ *    （未分区必须为 null）、容量上限为 ≥1 的整数等。
+ */
+export function validateSnapshot(input: unknown): JarSnapshot {
+  if (!isObject(input)) {
+    throw new Error('快照必须是 JSON 对象（收到的不是对象/数组无法解析），导入已取消，罐内容、容量与时钟均未改动');
+  }
+  if (input.format !== SNAPSHOT_FORMAT) {
+    throw new Error(`快照格式标识不符：缺少或错误的 format（应为 "${SNAPSHOT_FORMAT}"），导入已取消，旧罐、容量和时钟均不变`);
+  }
+  if (input.version !== SNAPSHOT_VERSION) {
+    throw new Error(`快照版本不受支持：version=${String(input.version)}，本版本仅支持 ${SNAPSHOT_VERSION}（请勿手工伪造或用其它版本的文件导入）；旧罐、容量和时钟均不变`);
+  }
+  if (!isInt(input.exportedAt) || input.exportedAt < 0) {
+    throw new Error('快照元信息 exportedAt 必须是非负整数时间戳；旧罐、容量和时钟均不变');
+  }
+  if (!Array.isArray(input.cookies)) {
+    throw new Error('快照字段 cookies 必须是数组；旧罐、容量和时钟均不变');
+  }
+  if (!isInt(input.nextIndex) || input.nextIndex < 1) {
+    throw new Error('快照字段 nextIndex（下一创建序号）必须是不小于 1 的整数；旧罐、容量和时钟均不变');
+  }
+  if (!isObject(input.capacity)) {
+    throw new Error('快照字段 capacity 必须是对象；旧罐、容量和时钟均不变');
+  }
+  if (!isObject(input.clock)) {
+    throw new Error('快照字段 clock 必须是对象；旧罐、容量和时钟均不变');
+  }
+
+  // ---- 时钟：起点 / 当前值 / 整秒推进 ----
+  const { startedAt, now } = input.clock as Record<string, unknown>;
+  if (!isInt(startedAt) || startedAt < 0) {
+    throw new Error('快照时钟 startedAt（演算起点）必须是非负整数毫秒时间戳；旧罐、容量和时钟均不变');
+  }
+  if (!isInt(now) || now < 0) {
+    throw new Error('快照时钟 now（当前演算时间）必须是非负整数毫秒时间戳；旧罐、容量和时钟均不变');
+  }
+  if (now < startedAt) {
+    throw new Error(`快照时间范围非法：时钟当前值 ${now} 早于起点 ${startedAt}（演算时钟只能向前推进）；旧罐、容量和时钟均不变`);
+  }
+  if ((now - startedAt) % 1000 !== 0) {
+    throw new Error('快照时钟非法：当前值与起点之差不是整秒数（演算时钟只能按正整数秒推进）；旧罐、容量和时钟均不变');
+  }
+
+  // ---- 容量规则 ----
+  const { globalLimit, domainLimits } = input.capacity as Record<string, unknown>;
+  if (globalLimit !== null && (!isInt(globalLimit) || globalLimit < 1)) {
+    throw new Error('快照容量 globalLimit 必须为 null（不限）或不小于 1 的整数；旧罐、容量和时钟均不变');
+  }
+  if (!Array.isArray(domainLimits)) {
+    throw new Error('快照容量 domainLimits 必须是 [{ domain, limit }] 数组；旧罐、容量和时钟均不变');
+  }
+  const normalizedDomainLimits: Array<{ domain: string; limit: number }> = [];
+  const domainLimitKeys = new Set<string>();
+  domainLimits.forEach((entry, i) => {
+    const where = `capacity.domainLimits[${i}]`;
+    if (!isObject(entry)) {
+      throw new Error(`快照容量规则第 ${i + 1} 项不是对象（${where}）；旧罐、容量和时钟均不变`);
+    }
+    if (typeof entry.domain !== 'string' || entry.domain.trim() === '') {
+      throw new Error(`快照容量规则第 ${i + 1} 项的 domain 必须是非空字符串；旧罐、容量和时钟均不变`);
+    }
+    const domain = canonicalizeDomain(entry.domain);
+    if (!isInt(entry.limit) || entry.limit < 1) {
+      throw new Error(`快照容量规则域 ${domain} 的 limit 必须是不小于 1 的整数；旧罐、容量和时钟均不变`);
+    }
+    if (domainLimitKeys.has(domain)) {
+      throw new Error(`快照容量规则中域 ${domain} 重复出现；旧罐、容量和时钟均不变`);
+    }
+    domainLimitKeys.add(domain);
+    normalizedDomainLimits.push({ domain, limit: entry.limit });
+  });
+
+  // ---- 逐条 Cookie ----
+  const cookies: SnapshotCookie[] = [];
+  const identityKeys = new Set<string>();
+  const indexKeys = new Set<number>();
+
+  input.cookies.forEach((raw, i) => {
+    const label = `cookies[${i}]（第 ${i + 1} 条）`;
+    if (!isObject(raw)) {
+      throw new Error(`快照${label}不是对象；旧罐、容量和时钟均不变`);
+    }
+
+    const requireString = (key: string): string => {
+      const v = raw[key];
+      if (typeof v !== 'string') {
+        throw new Error(`快照${label}的 ${key} 必须是字符串；旧罐、容量和时钟均不变`);
+      }
+      return v;
+    };
+    const requireBool = (key: string): boolean => {
+      const v = raw[key];
+      if (!isBool(v)) {
+        throw new Error(`快照${label}的 ${key} 必须是布尔值 true/false；旧罐、容量和时钟均不变`);
+      }
+      return v;
+    };
+    const requireTime = (key: string): number => {
+      const v = raw[key];
+      if (!isInt(v) || v < 0) {
+        throw new Error(`快照${label}的 ${key} 必须是非负整数毫秒时间戳；旧罐、容量和时钟均不变`);
+      }
+      return v;
+    };
+
+    const name = requireString('name');
+    if (name.length === 0 || !VALID_NAME_RE.test(name)) {
+      throw new Error(`快照${label}的 name 非法（需为 RFC 6265 token，非空）："${name}"；旧罐、容量和时钟均不变`);
+    }
+    const value = requireString('value');
+
+    const rawDomain = requireString('domain');
+    const domain = canonicalizeDomain(rawDomain);
+    if (domain.length === 0) {
+      throw new Error(`快照${label}的 domain 规范化后为空："${rawDomain}"；旧罐、容量和时钟均不变`);
+    }
+    const path = requireString('path');
+    if (!path.startsWith('/')) {
+      throw new Error(`快照${label}的 path 必须是以 "/" 开头的绝对路径："${path}"；旧罐、容量和时钟均不变`);
+    }
+
+    const hostOnly = requireBool('hostOnly');
+    const secure = requireBool('secure');
+    const httpOnly = requireBool('httpOnly');
+    const sameSiteDefault = requireBool('sameSiteDefault');
+    const priorityDefault = requireBool('priorityDefault');
+    const partitioned = requireBool('partitioned');
+
+    const sameSite = requireString('sameSite');
+    if (!SAME_SITE_VALUES.has(sameSite as SameSiteMode)) {
+      throw new Error(`快照${label}的 sameSite 只能是 strict/lax/none："${sameSite}"；旧罐、容量和时钟均不变`);
+    }
+    const priority = requireString('priority');
+    if (!PRIORITY_VALUES.has(priority as CookiePriority)) {
+      throw new Error(`快照${label}的 priority 只能是 low/medium/high："${priority}"；旧罐、容量和时钟均不变`);
+    }
+    if (sameSite === 'none' && !secure) {
+      throw new Error(`快照${label}自相矛盾：SameSite=None 的条目必须 Secure=true；旧罐、容量和时钟均不变`);
+    }
+
+    // 分区键：分区项必须带非空字符串；未分区项必须为 null
+    const partitionKeyRaw = raw.partitionKey;
+    let partitionKey: string | null;
+    if (partitioned) {
+      if (typeof partitionKeyRaw !== 'string' || partitionKeyRaw.trim() === '') {
+        throw new Error(`快照${label}标记为 Partitioned，partitionKey 必须是非空字符串（scheme + 可注册域）；旧罐、容量和时钟均不变`);
+      }
+      if (!secure) {
+        throw new Error(`快照${label}自相矛盾：Partitioned 条目必须 Secure=true；旧罐、容量和时钟均不变`);
+      }
+      partitionKey = partitionKeyRaw;
+    } else {
+      if (partitionKeyRaw !== null) {
+        throw new Error(`快照${label}未分区（partitioned=false），partitionKey 必须为 null；旧罐、容量和时钟均不变`);
+      }
+      partitionKey = null;
+    }
+
+    // 序号：正整数、唯一、且严格小于 nextIndex
+    const creationIndex = raw.creationIndex;
+    if (!isInt(creationIndex) || creationIndex < 1) {
+      throw new Error(`快照${label}的 creationIndex 必须是不小于 1 的整数；旧罐、容量和时钟均不变`);
+    }
+    if (creationIndex >= (input.nextIndex as number)) {
+      throw new Error(`快照${label}的 creationIndex=${creationIndex} 不小于 nextIndex=${input.nextIndex as number}（序号一致性：下一序号必须大于全部已有序号）；旧罐、容量和时钟均不变`);
+    }
+    if (indexKeys.has(creationIndex)) {
+      throw new Error(`快照中创建序号 ${creationIndex} 重复出现（#${creationIndex}）；条目序号必须唯一；旧罐、容量和时钟均不变`);
+    }
+    indexKeys.add(creationIndex);
+
+    // 身份唯一性：(name, domain, path, partitionKey)
+    const identity = `${name} ${domain} ${path} ${partitionKey === null ? '' : partitionKey}`;
+    if (identityKeys.has(identity)) {
+      const partText = partitionKey === null ? '未分区' : `分区 ${partitionKey}`;
+      throw new Error(
+        `快照中存在身份重复的条目：${name}（domain=${domain}，path=${path}，${partText}）` +
+        `——(name, domain, path, 分区键) 必须唯一；旧罐、容量和时钟均不变`,
+      );
+    }
+    identityKeys.add(identity);
+
+    // 时间范围：创建/更新/最近访问都在 [起点, 当前值] 内
+    const createdAt = requireTime('createdAt');
+    const updatedAt = requireTime('updatedAt');
+    const lastAccessedAt = requireTime('lastAccessedAt');
+    for (const [tKey, tVal] of [
+      ['createdAt', createdAt],
+      ['updatedAt', updatedAt],
+      ['lastAccessedAt', lastAccessedAt],
+    ] as const) {
+      if (tVal < startedAt || tVal > now) {
+        throw new Error(
+          `快照${label}的 ${tKey}=${tVal} 超出时钟范围 [${startedAt}, ${now}]` +
+          `（条目时间不得早于时钟起点，也不得晚于当前值）；旧罐、容量和时钟均不变`,
+        );
+      }
+    }
+
+    // expiresAt：省略或 null = 会话 cookie；否则为非负整数
+    let expiresAt: number | undefined;
+    if (raw.expiresAt !== undefined && raw.expiresAt !== null) {
+      const exp = raw.expiresAt;
+      if (!isInt(exp) || exp < 0) {
+        throw new Error(`快照${label}的 expiresAt 必须是非负整数毫秒时间戳，或省略/null 表示会话 cookie；旧罐、容量和时钟均不变`);
+      }
+      expiresAt = exp;
+    }
+
+    cookies.push({
+      name,
+      value,
+      domain,
+      path,
+      hostOnly,
+      secure,
+      httpOnly,
+      sameSite: sameSite as SameSiteMode,
+      sameSiteDefault,
+      priority: priority as CookiePriority,
+      priorityDefault,
+      partitioned,
+      partitionKey,
+      ...(expiresAt === undefined ? {} : { expiresAt }),
+      creationIndex,
+      createdAt,
+      updatedAt,
+      lastAccessedAt,
+    });
+  });
+
+  cookies.sort((a, b) => a.creationIndex - b.creationIndex);
+
+  return {
+    format: SNAPSHOT_FORMAT,
+    version: SNAPSHOT_VERSION,
+    exportedAt: input.exportedAt,
+    exportedAtReadable: formatTime(input.exportedAt),
+    cookies,
+    nextIndex: input.nextIndex as number,
+    capacity: {
+      globalLimit: globalLimit as number | null,
+      domainLimits: normalizedDomainLimits,
+    },
+    clock: {
+      startedAt: startedAt as number,
+      now: now as number,
+    },
+  };
 }

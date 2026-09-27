@@ -19,6 +19,12 @@
  *                                以及对同身份未过期 HttpOnly 项的覆盖或 Max-Age 删除
  *                                （拒绝时罐内容、时间戳、容量不变；网络接口 /api/store 不受此限）
  *   POST /api/capacity           { globalLimit?, domainLimits? } 设置全局/每可注册域容量并立即执行淘汰
+ *   GET  /api/snapshot           下载场景快照（带 format/version：原始 Cookie 条目（含分区键、
+ *                                创建序号与创建/最近访问时间）、容量规则、时钟起点与当前值、下一序号）
+ *   POST /api/snapshot/import    导入场景快照（body 为快照对象本身，或 { snapshot } 包裹）：
+ *                                先完整校验结构/时间范围/条目身份唯一性/序号一致性，
+ *                                通过后一次性替换罐、容量与时钟；任一校验失败返回 400，
+ *                                旧罐、容量和时钟均不变；恢复不执行淘汰，过期项原样保留
  *   GET  /api/clock              读取演算时钟（当前演算时间、启动时刻、已推进秒数）
  *   POST /api/clock/advance      { seconds } 以正整数秒推进演算时钟；非法输入（缺省、0、负数、
  *                                非整数、非数字）返回 400，时钟与罐均不变；推进本身不删除条目，
@@ -38,8 +44,25 @@ import { CookieJar } from './cookieJar';
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '2mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
+
+// JSON 解析失败（非法 JSON / 体积超限）统一返回 JSON 400，而不是 Express 默认的 HTML 错误页
+app.use((err: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent || req.method === 'GET') {
+    next(err);
+    return;
+  }
+  if (err instanceof SyntaxError) {
+    res.status(400).json({ ok: false, error: `请求体不是合法 JSON（${err.message}）；导入已取消，旧罐、容量和时钟均不变` });
+    return;
+  }
+  if (err instanceof Error && (err as { type?: string }).type === 'entity.too.large') {
+    res.status(400).json({ ok: false, error: '快照体积超过 2MB 上限；导入已取消，旧罐、容量和时钟均不变' });
+    return;
+  }
+  next(err);
+});
 
 // 全局唯一的内存 Cookie 罐（演示用，单实例即可）
 const jar = new CookieJar();
@@ -233,6 +256,41 @@ app.post('/api/capacity', (req, res) => {
 
 app.get('/api/jar', (_req, res) => {
   res.json({ ok: true, cookies: jar.list(), capacity: jar.capacity(), clock: jar.clock() });
+});
+
+// 场景快照下载：返回带 format/version 的完整状态（原始条目 + 容量规则 + 时钟 + 下一序号）
+app.get('/api/snapshot', (_req, res) => {
+  const snapshot = jar.snapshot();
+  res.json({
+    ok: true,
+    snapshot,
+    // 便于界面直接展示
+    cookieCount: snapshot.cookies.length,
+    clock: jar.clock(),
+    capacity: jar.capacity(),
+  });
+});
+
+// 场景快照导入：body 可以是快照对象本身，也可以是 { snapshot: {...} }
+app.post('/api/snapshot/import', (req, res) => {
+  const body = req.body ?? {};
+  const candidate = typeof body === 'object' && body !== null && 'snapshot' in body
+    ? (body as { snapshot: unknown }).snapshot
+    : body;
+  try {
+    const result = jar.importSnapshot(candidate);
+    res.status(200).json({
+      ...result,
+      message:
+        `场景快照已导入并一次性替换全部状态：恢复 ${result.restoredCount} 条 Cookie` +
+        `（过期项原样保留）、${result.domainLimitCount} 条域级容量规则` +
+        `（全局${result.globalLimit === null ? '不限' : `上限 ${result.globalLimit}`}），` +
+        `演算时钟恢复到 ${result.clock.readable}；后续发送排序、默认 Lax 宽限与容量淘汰与导出前连续操作一致`,
+    });
+  } catch (err) {
+    // 完整校验未通过：旧罐、容量和时钟均不变
+    res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.get('/api/clock', (_req, res) => {

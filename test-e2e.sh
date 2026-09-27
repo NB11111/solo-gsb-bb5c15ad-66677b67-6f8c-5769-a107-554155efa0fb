@@ -1008,6 +1008,184 @@ check "重置提示时钟复位" "演算时钟" "$R"
 post /api/reset '{}' >/dev/null
 
 echo
+echo "------- 场景快照（/api/snapshot + /api/snapshot/import）演算 -------"
+
+SNAP_FILE="$(dirname "$0")/test-snapshot.tmp.json"
+trap 'rm -f "$SNAP_FILE"' EXIT
+
+echo "== Q1. 准备场景（容量规则 + 普通/分区条目 + 时钟推进 + 已过期项） =="
+post /api/capacity '{"globalLimit":9,"domainLimits":{"example.com":7}}' >/dev/null
+post /api/store '{"url":"https://shop.example.com/admin","setCookie":"qk=1; Path=/admin; Max-Age=30; Priority=High"}' >/dev/null
+post /api/store '{"url":"https://example.com/","setCookie":"qp=2; Path=/; SameSite=None; Secure"}' >/dev/null
+post /api/store '{"url":"https://w.vendor.com/frame","setCookie":"qc=3; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://site-a.example/"}' >/dev/null
+adv 100
+# qk 已过期（Max-Age=30，已推进 100 秒）
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['clock']['elapsedSeconds']==100, d['clock']
+rows={c['name']:c for c in d['cookies']}
+assert rows['qk']['expired'] is True, rows['qk']
+assert rows['qc']['partitionKey']=='https://site-a.example', rows['qc']
+print('✅ 场景就绪：3 条（qk 已过期、qc 为 site-a 分区项）、时钟 100 秒')" && PASS=$((PASS+1)) || { echo "❌ 场景准备失败"; FAIL=$((FAIL+1)); }
+
+echo "== Q2. 下载快照：带 format/version，含原始条目/分区键/序号/时间/容量/时钟/下一序号 =="
+curl -s "$BASE/api/snapshot" -o "$SNAP_FILE"
+python3 - "$SNAP_FILE" <<'EOF'
+import sys,json
+s=json.load(open(sys.argv[1]))['snapshot']
+assert s['format']=='cookie-jar-lab-snapshot', s.get('format')
+assert s['version']==1, s.get('version')
+assert isinstance(s['exportedAt'],int) and s['exportedAt']>0
+assert [c['creationIndex'] for c in s['cookies']]==[1,2,3], s['cookies']
+assert s['nextIndex']==4, s['nextIndex']
+assert s['capacity']['globalLimit']==9, s['capacity']
+assert s['capacity']['domainLimits']==[{'domain':'example.com','limit':7}], s['capacity']
+assert s['clock']['now']-s['clock']['startedAt']==100_000, s['clock']
+qk=[c for c in s['cookies'] if c['name']=='qk'][0]
+assert qk['expiresAt'] is not None and qk['createdAt']==s['clock']['startedAt']
+assert qk['lastAccessedAt']==s['clock']['startedAt']
+qc=[c for c in s['cookies'] if c['name']=='qc'][0]
+assert qc['partitioned'] is True and qc['partitionKey']=='https://site-a.example'
+print('✅ 快照字段完整（原始 StoredCookie 条目、容量规则、时钟、下一序号）')
+EOF
+[ $? -eq 0 ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+echo "== Q3. 污染罐（写入无关条目、改容量、重置时钟）后导入：一次性精确替换 =="
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+post /api/store '{"url":"https://intruder.test/","setCookie":"zzz=nope; Path=/"}' >/dev/null
+adv 7
+R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' --data @"$SNAP_FILE")
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['ok'] is True, d
+assert d['restoredCount']==3, d
+assert d['domainLimitCount']==1 and d['globalLimit']==9, d
+assert d['clock']['elapsedSeconds']==100, d['clock']
+names=[c['name'] for c in d['jar']]
+assert names==['qk','qp','qc'], names
+assert d['jar'][0]['expired'] is True, '过期项必须原样保留'
+assert d['snapshot']['nextIndex']==4
+print('✅ 导入恢复 3 条（含过期 qk）、容量规则、时钟 100 秒；入侵者 zzz 消失')" && PASS=$((PASS+1)) || { echo "❌ 导入替换结果错误: $R"; FAIL=$((FAIL+1)); }
+J=$(curl -s "$BASE/api/jar")
+check "GET /api/jar 与导入后一致（无 zzz）" '"totalCount":3' "$J"
+
+echo "== Q4. 新写入沿用快照下一序号 #4 =="
+R=$(post /api/store '{"url":"https://example.com/","setCookie":"qn=4; Path=/"}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['cookie']['index']==4, d['cookie']
+assert [c['index'] for c in d['jar']]==[1,2,3,4], d['jar']
+print('✅ 新条目编号 #4，创建序号连续')" && PASS=$((PASS+1)) || { echo "❌ 下一序号未延续"; FAIL=$((FAIL+1)); }
+
+echo "== Q5. 恢复后行为连续：默认 Lax 120 秒宽限按创建时间、排序一致 =="
+# qn(#4, 默认 Lax, 路径 /)创建于时钟 100 秒处；同站请求先发一次刷新其访问时间不影响宽限
+R=$(post /api/send '{"url":"https://example.com/","topUrl":"https://other.org/","method":"POST","topLevelNav":true}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+# qn 刚创建 0 秒（时钟仍在 100 秒），默认 Lax 跨站顶层 POST 放行；qp 是 None 也放行
+check "刚恢复的默认 Lax 在 120 秒宽限内放行" "qn=4" "$HDR"
+adv 121
+R=$(post /api/send '{"url":"https://example.com/","topUrl":"https://other.org/","method":"POST","topLevelNav":true}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"qn=4"* ]]; then echo "✅ 恢复 121 秒后默认 Lax 宽限过期（按快照的创建时间计算）"; PASS=$((PASS+1));
+else echo "❌ 恢复后 Lax 宽限计算错误"; FAIL=$((FAIL+1)); fi
+check "宽限已过原因" "120 秒宽限已过" "$R"
+# qp（SameSite=None）跨站照常发送
+check "None 项跨站仍发送" "qp=2" "$HDR"
+# qk 已过期不发送
+if [[ "$HDR" != *"qk=1"* ]]; then echo "✅ 恢复的过期项不发送（但仍在罐中）"; PASS=$((PASS+1));
+else echo "❌ 过期项被发送"; FAIL=$((FAIL+1)); fi
+J=$(curl -s "$BASE/api/jar")
+check "过期项仍保留在罐中" '"name":"qk"' "$J"
+
+echo "== Q6. 恢复后容量淘汰连续：Priority/最近访问/创建序号规则一致 =="
+# 当前 4 条（qk 已过期、qp、qc、qn）。设 example.com 域上限 2：
+# 超限先清过期 qk；其余 qp(Medium? qp 未声明 Priority=Medium) 与 qn(Medium) 两条 -> 回到 2/2，不再淘汰
+R=$(post /api/capacity '{"domainLimits":{"example.com":2}}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+stages=[s for s in d['eviction']['stages'] if s['scope']=='domain']
+assert stages and stages[0]['expiredRemoved']==1, stages
+assert stages[0]['evictedCount']==0, stages
+removed=[r['cookie'] for r in stages[0]['removed']]
+assert removed==['qk=1'], removed
+names=sorted(c['name'] for c in d['cookies'])
+assert 'qp' in names and 'qn' in names and 'qk' not in names, names
+print('✅ 恢复后超限先清理过期项 qk，未触发优先级淘汰（与导出前连续操作一致）')" && PASS=$((PASS+1)) || { echo "❌ 恢复后淘汰行为异常: $R"; FAIL=$((FAIL+1)); }
+
+echo "== Q7. 各类非法快照 -> 400，且旧罐、容量和时钟均不变 =="
+BEFORE=$(curl -s "$BASE/api/jar")
+snapshot_reject() { # python-mutation-desc
+  local desc="$1"; local mut="$2"
+  CODE=$(python3 - "$SNAP_FILE" "$mut" <<'EOF'
+import sys,json,urllib.request,urllib.error,copy
+s=json.load(open(sys.argv[1]))['snapshot']
+mut=sys.argv[2]
+if mut=='noformat': s.pop('format',None)
+elif mut=='version': s['version']=99
+elif mut=='nextindex': s['nextIndex']=2
+elif mut=='dup_identity': s['cookies'].append(dict(s['cookies'][1]))
+elif mut=='dup_index':
+    c=dict(s['cookies'][0]); c['name']='otherx'
+    s['cookies'].append(c)
+elif mut=='clock_back': s['clock']['now']=s['clock']['startedAt']-1000
+elif mut=='clock_half': s['clock']['now']=s['clock']['startedAt']+500
+elif mut=='time_future': s['cookies'][0]['createdAt']=s['clock']['now']+1000
+elif mut=='time_past': s['cookies'][0]['lastAccessedAt']=s['clock']['startedAt']-1000
+elif mut=='none_secure': s['cookies'][1]['secure']=False
+elif mut=='enum': s['cookies'][0]['sameSite']='banana'
+elif mut=='part_key': s['cookies'][0]['partitioned']=True
+elif mut=='cap0': s['capacity']['globalLimit']=0
+elif mut=='capneg': s['capacity']['domainLimits'][0]['limit']=-3
+req=urllib.request.Request('http://localhost:3000/api/snapshot/import',
+    data=json.dumps(s).encode(), headers={'Content-Type':'application/json'}, method='POST')
+try:
+    urllib.request.urlopen(req); print(200)
+except urllib.error.HTTPError as e:
+    print(e.code)
+EOF
+)
+  [ "$CODE" = "400" ] && { echo "✅ $desc -> 400"; PASS=$((PASS+1)); } || { echo "❌ $desc 应 400，实际 $CODE"; FAIL=$((FAIL+1)); }
+}
+snapshot_reject "缺少 format" noformat
+snapshot_reject "版本号不受支持" version
+snapshot_reject "序号一致性（nextIndex 太小）" nextindex
+snapshot_reject "条目身份重复" dup_identity
+snapshot_reject "创建序号重复" dup_index
+snapshot_reject "时钟当前值早于起点" clock_back
+snapshot_reject "时钟非整秒推进" clock_half
+snapshot_reject "条目时间晚于当前值" time_future
+snapshot_reject "条目时间早于时钟起点" time_past
+snapshot_reject "SameSite=None 未带 Secure" none_secure
+snapshot_reject "sameSite 枚举非法" enum
+snapshot_reject "Partitioned 缺分区键" part_key
+snapshot_reject "全局容量 0" cap0
+snapshot_reject "域容量为负" capneg
+
+# 非 JSON / 数组
+for bad in '[1,2,3]' '{bad json'; do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' -d "$bad")
+  [ "$CODE" = "400" ] && { echo "✅ 非法载荷（$bad）-> 400"; PASS=$((PASS+1)); } || { echo "❌ 应 400，实际 $CODE"; FAIL=$((FAIL+1)); }
+done
+
+AFTER=$(curl -s "$BASE/api/jar")
+if [ "$BEFORE" = "$AFTER" ]; then echo "✅ 全部非法导入被拒后旧罐、容量和时钟均不变"; PASS=$((PASS+1));
+else echo "❌ 非法导入改动了状态"; FAIL=$((FAIL+1)); fi
+
+# { snapshot } 包裹形式也接受（单独成功用例，不影响上面的不变性对比）
+R=$(curl -s -X POST "$BASE/api/snapshot/import" -H 'Content-Type: application/json' \
+  -d "{\"snapshot\":$(python3 -c "import json;print(json.dumps(json.load(open('$SNAP_FILE'))['snapshot']))")}")
+check "包裹形式 {snapshot} 导入成功" '"ok":true' "$R"
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

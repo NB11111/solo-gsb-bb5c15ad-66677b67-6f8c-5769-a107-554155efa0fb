@@ -25,6 +25,11 @@ const els = {
   jarWrap: $('#jar-table-wrap'),
   jarEmpty: $('#jar-empty'),
 
+  snapshotDownload: $('#snapshot-download'),
+  snapshotImport: $('#snapshot-import'),
+  snapshotFile: $('#snapshot-file'),
+  snapshotResult: $('#snapshot-result'),
+
   clockNow: $('#clock-now'),
   clockMeta: $('#clock-meta'),
   clockSeconds: $('#clock-seconds'),
@@ -192,6 +197,109 @@ async function refreshJar() {
   }
   if (data.clock) renderClock(data.clock);
 }
+
+/* ---------- 场景快照：下载 / 导入 ---------- */
+
+/** 快照文件名时间戳：YYYYMMDD-HHMMSS（本地时区），仅用于命名 */
+function snapshotFileStamp(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function renderSnapshotOk(data) {
+  els.snapshotResult.classList.remove('hidden');
+  const expiredCount = (data.jar || []).filter((c) => c.expired).length;
+  const limitText = data.globalLimit === null ? '不限' : `全局上限 ${data.globalLimit}`;
+  els.snapshotResult.innerHTML =
+    `<div class="banner ok">
+      <span class="banner-title">✅ 快照导入成功</span>${escapeHtml(data.message || '场景已恢复')}
+    </div>
+    <div class="dim">恢复条目 <strong>${data.restoredCount}</strong> 条（其中过期 ${expiredCount} 条，原样保留）· ` +
+    `域级容量规则 <strong>${data.domainLimitCount}</strong> 条 · ${escapeHtml(limitText)} · ` +
+    `演算时钟 <strong>${escapeHtml(data.clock ? data.clock.readable : '')}</strong>（起点 ${escapeHtml(data.clock ? data.clock.startedAtReadable : '')}）· ` +
+    `下一创建序号 <strong>#${data.snapshot ? data.snapshot.nextIndex : ''}</strong></div>`;
+}
+
+function renderSnapshotError(message) {
+  els.snapshotResult.classList.remove('hidden');
+  els.snapshotResult.innerHTML =
+    `<div class="banner bad"><span class="banner-title">⛔ 快照导入失败</span>${escapeHtml(message)}</div>`;
+}
+
+els.snapshotDownload.addEventListener('click', async () => {
+  els.snapshotDownload.disabled = true;
+  try {
+    const resp = await fetch('/api/snapshot');
+    if (!resp.ok) throw new Error(`下载失败（HTTP ${resp.status}）`);
+    const data = await resp.json();
+    const snapshot = data.snapshot;
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cookie-jar-snapshot-${snapshotFileStamp(new Date(snapshot.exportedAt))}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    els.snapshotResult.classList.remove('hidden');
+    els.snapshotResult.innerHTML =
+      `<div class="banner ok"><span class="banner-title">⬇ 已导出场景快照</span>` +
+      `版本 v${snapshot.version}：${snapshot.cookies.length} 条 Cookie（含分区键、创建序号与创建/最近访问时间）、` +
+      `${snapshot.capacity.domainLimits.length} 条域级容量规则（全局${snapshot.capacity.globalLimit === null ? '不限' : `上限 ${snapshot.capacity.globalLimit}`}）、` +
+      `演算时钟（起点 ${escapeHtml(data.clock ? data.clock.startedAtReadable : '')} → 当前 ${escapeHtml(data.clock ? data.clock.readable : '')}）、下一序号 #${snapshot.nextIndex}</div>`;
+  } catch (err) {
+    renderSnapshotError(err instanceof Error ? err.message : String(err));
+  } finally {
+    els.snapshotDownload.disabled = false;
+  }
+});
+
+els.snapshotImport.addEventListener('click', () => {
+  // 清空 value，使重复选择同一文件也能再次触发 change
+  els.snapshotFile.value = '';
+  els.snapshotFile.click();
+});
+
+els.snapshotFile.addEventListener('change', async () => {
+  const file = els.snapshotFile.files && els.snapshotFile.files[0];
+  if (!file) return;
+  let parsed;
+  try {
+    const text = await file.text();
+    parsed = JSON.parse(text);
+  } catch (err) {
+    renderSnapshotError(`文件 ${file.name} 不是合法 JSON（${err instanceof Error ? err.message : String(err)}）；导入已取消，旧罐、容量和时钟均不变`);
+    return;
+  }
+  // 服务端做完整结构/时间/身份/序号校验；支持快照对象本身或 { snapshot } 包裹
+  const candidate = parsed && typeof parsed === 'object' && 'snapshot' in parsed ? parsed.snapshot : parsed;
+  els.snapshotImport.disabled = true;
+  try {
+    const data = await postJSON('/api/snapshot/import', candidate);
+    renderSnapshotOk(data);
+    // 导入结果刷新罐表、容量面板与时钟
+    if (data.jar) renderJar(data.jar);
+    if (data.capacity) {
+      renderCapacityUsage(data.capacity);
+      syncCapacityInputs(data.capacity);
+    }
+    if (data.clock) renderClock(data.clock);
+    // 状态已整体替换，收起其它演算结果，避免与恢复后的场景错位
+    els.storeResult.classList.add('hidden');
+    els.sendResult.classList.add('hidden');
+    els.capResult.classList.add('hidden');
+    els.scriptReadResult.classList.add('hidden');
+    els.scriptWriteResult.classList.add('hidden');
+    els.clockResult.classList.add('hidden');
+    toast(`快照已导入：${data.restoredCount} 条 Cookie，容量规则与时钟已恢复`);
+  } catch (err) {
+    renderSnapshotError(err instanceof Error ? err.message : String(err));
+  } finally {
+    els.snapshotImport.disabled = false;
+  }
+});
 
 /* ---------- 演算时钟 ---------- */
 
@@ -566,6 +674,7 @@ els.resetBtn.addEventListener('click', async () => {
     els.scriptReadResult.classList.add('hidden');
     els.scriptWriteResult.classList.add('hidden');
     els.clockResult.classList.add('hidden');
+    els.snapshotResult.classList.add('hidden');
     els.storeCookie.value = '';
     toast('Cookie 罐已重置（容量设置保留，时钟回到启动时刻）');
   } catch (err) {
